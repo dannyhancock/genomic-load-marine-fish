@@ -1,0 +1,574 @@
+// Kyriazis et al. 2023 DFE framework applied to fish demographics
+//
+// Pipeline: SLiM -> CSV (stdout) -> R (plotting/stats)
+//
+// DFE: Kim et al. 2017 gamma (mean=-0.01314833, shape=0.186)
+//      + 0.3% recessive lethals (Kyriazis et al. 2023)
+//      Binned into 5 mutation types with inverse h-s relationship
+//
+// Genome: Gene-based structure
+//      5 chromosomes x 500 genes x 1840 bp
+//      No recombination within genes, 1e-4 between genes, 0.5 between chroms
+//
+// Population topology: 17 populations
+//   A (stable), B (expansion), D (ancient bottleneck only)
+//   CE1-CE4: recent-only severity gradient (all at t=10 real gen)
+//   CT1, CT3, CT4: recent-only timing gradient (t=5, 20, 50 real gen)
+//   E1-E4: ancient+recent severity gradient (all at t=10 real gen)
+//   T1, T3, T4: ancient+recent timing gradient (t=5, 20, 50 real gen)
+//   CE3 (t=10) and E3 (t=10) serve double duty in severity+timing gradients
+//   CE3 and E3 continue as CE3R/E3R recovery outputs after T_SNAPSHOT
+//   All recent timings are Q-scaled: T_RECENT_X = T_SNAPSHOT - max(1, X/Q)
+
+
+// =============================================================================
+// compute Morton 2B inbreeding load for a subset of mutations
+// s should be positive (|s|), already unscaled by Q
+// =============================================================================
+function (float)mortonLoad(float q, float s, float h, logical mask)
+{
+	if (sum(mask) == 0)
+		return 0.0;
+
+	mq = q[mask];
+	ms = s[mask];
+	mh = h[mask];
+
+	return 2.0 * (sum(mq * ms) - sum(mq^2 * ms) - 2.0 * sum(mq * (1.0 - mq) * ms * mh));
+}
+
+
+// =============================================================================
+// output one CSV row of load metrics for a single population
+// union counts = per-mutation-type total counts across ALL pops (for genotype proportions)
+// =============================================================================
+function (void)outputPopCSV(object<Subpopulation> pop, string pop_name,
+	integer union_m0, integer union_m1, integer union_m2,
+	integer union_m3, integer union_m4, integer union_m5)
+{
+	n_ind = pop.individuals.size();
+	gen_load = 1.0 - mean(pop.cachedFitness(NULL));
+	all_muts = sim.mutations;
+	q_all = pop.genomes.mutationFrequenciesInGenomes(all_muts);
+	present = (q_all > 0.0);
+	muts = all_muts[present];
+	n_muts = size(muts);
+
+	// Number of per-type metric columns: 6 types x 12 metrics = 72
+	if (n_muts == 0) {
+		cat(sim.cycle + "," + REPLICATE + "," + pop_name + "," + n_ind + "," + gen_load + ",");
+		cat("0.0,0.0,0.0,0,");
+		// 6 types x 12 metrics = 72 zeros
+		zeros = "";
+		for (i in seqLen(6)) {
+			zeros = zeros + "0,0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0";
+			if (i < 5) zeros = zeros + ",";
+		}
+		cat(zeros + "\n");
+		return;
+	}
+
+	// === Frequency-based metrics ===
+	q = q_all[present];
+	abs_s = abs(muts.selectionCoeff) / Q;
+	abs_s = ifelse(abs_s > 1.0, 1.0, abs_s);
+	dom = muts.mutationType.dominanceCoeff;
+
+	is_m0 = (muts.mutationType == m0);
+	is_m1 = (muts.mutationType == m1);
+	is_m2 = (muts.mutationType == m2);
+	is_m3 = (muts.mutationType == m3);
+	is_m4 = (muts.mutationType == m4);
+	is_m5 = (muts.mutationType == m5);
+
+	seg = (q > 0.0 & q < 1.0);
+	fix = (q == 1.0);
+
+	// Inbreeding load (Morton 2B) - overall
+	all_del = (is_m1 | is_m2 | is_m3 | is_m4 | is_m5);
+	ib_total = mortonLoad(q, abs_s, dom, all_del);
+	s01_mask = all_del & (abs_s > 0.1);
+	ib_s01 = mortonLoad(q, abs_s, dom, s01_mask);
+	s099_mask = all_del & (abs_s > 0.99);
+	ib_s099 = mortonLoad(q, abs_s, dom, s099_mask);
+
+	// === Individual-based genotype counts per mutation type ===
+	samp_n = asInteger(min(SAMPLE_SIZE, n_ind));
+	samp = sample(pop.individuals, samp_n, replace=F);
+
+	// het/hom sums for each mutation type
+	m0_het_sum = 0; m0_hom_sum = 0;
+	m1_het_sum = 0; m1_hom_sum = 0;
+	m2_het_sum = 0; m2_hom_sum = 0;
+	m3_het_sum = 0; m3_hom_sum = 0;
+	m4_het_sum = 0; m4_hom_sum = 0;
+	m5_het_sum = 0; m5_hom_sum = 0;
+
+	for (j in seqLen(samp_n)) {
+		ind = samp[j];
+		hom = setIntersection(ind.genome1.mutations, ind.genome2.mutations);
+		het = setSymmetricDifference(ind.genome1.mutations, ind.genome2.mutations);
+
+		if (size(hom) > 0) {
+			ht = hom.mutationType;
+			m0_hom_sum = m0_hom_sum + sum(ht == m0);
+			m1_hom_sum = m1_hom_sum + sum(ht == m1);
+			m2_hom_sum = m2_hom_sum + sum(ht == m2);
+			m3_hom_sum = m3_hom_sum + sum(ht == m3);
+			m4_hom_sum = m4_hom_sum + sum(ht == m4);
+			m5_hom_sum = m5_hom_sum + sum(ht == m5);
+		}
+
+		if (size(het) > 0) {
+			ht = het.mutationType;
+			m0_het_sum = m0_het_sum + sum(ht == m0);
+			m1_het_sum = m1_het_sum + sum(ht == m1);
+			m2_het_sum = m2_het_sum + sum(ht == m2);
+			m3_het_sum = m3_het_sum + sum(ht == m3);
+			m4_het_sum = m4_het_sum + sum(ht == m4);
+			m5_het_sum = m5_het_sum + sum(ht == m5);
+		}
+	}
+
+	// Collect per-type data into parallel vectors for looped output
+	type_masks = c(is_m0, is_m1, is_m2, is_m3, is_m4, is_m5);
+	n_total = size(muts);
+	unions = c(union_m0, union_m1, union_m2, union_m3, union_m4, union_m5);
+	het_sums = c(m0_het_sum, m1_het_sum, m2_het_sum, m3_het_sum, m4_het_sum, m5_het_sum);
+	hom_sums = c(m0_hom_sum, m1_hom_sum, m2_hom_sum, m3_hom_sum, m4_hom_sum, m5_hom_sum);
+
+	// === OUTPUT CSV ROW ===
+	cat(sim.cycle + "," + REPLICATE + "," + pop_name + "," + n_ind + "," + gen_load + ",");
+	cat(ib_total + "," + ib_s01 + "," + ib_s099 + ",");
+	cat(n_muts + ",");
+
+	// Per-type metrics block (6 types)
+	for (ti in seqLen(6)) {
+		is_type = type_masks[(ti * n_total):((ti + 1) * n_total - 1)];
+		t_seg = sum(is_type & seg);
+		t_fix = sum(is_type & fix);
+		t_tot = sum(is_type);
+
+		// Mean allele frequency
+		t_mean_freq = 0.0;
+		if (t_tot > 0) t_mean_freq = mean(q[is_type]);
+
+		// Load total: sum(q * |s|)
+		t_load_total = 0.0;
+		if (t_tot > 0) t_load_total = sum(q[is_type] * abs_s[is_type]);
+
+		// Population-level realized load
+		t_pop_real = 0.0;
+		if (t_tot > 0) {
+			tq = q[is_type]; ts = abs_s[is_type]; th = dom[is_type];
+			t_pop_real = sum(tq^2 * ts) + 2.0 * sum(tq * (1.0 - tq) * th * ts);
+		}
+		t_pop_masked = t_load_total - t_pop_real;
+
+		// Inbreeding load
+		t_ib = mortonLoad(q, abs_s, dom, is_type);
+
+		// Genotype proportions (union-of-sites denominator)
+		t_prop_het = 0.0;
+		t_prop_hom_der = 0.0;
+		t_geno_n = asFloat(samp_n) * unions[ti];
+		if (t_geno_n > 0) {
+			t_prop_het = asFloat(het_sums[ti]) / t_geno_n;
+			t_prop_hom_der = asFloat(hom_sums[ti]) / t_geno_n;
+		}
+
+		t_mean_het = asFloat(het_sums[ti]) / samp_n;
+		t_mean_hom = asFloat(hom_sums[ti]) / samp_n;
+
+		cat(t_seg + "," + t_fix + "," + t_tot + "," + t_mean_freq + ",");
+		cat(t_load_total + "," + t_pop_real + "," + t_pop_masked + ",");
+		cat(t_ib + "," + t_prop_het + "," + t_prop_hom_der + ",");
+		cat(t_mean_het + "," + t_mean_hom);
+		if (ti < 5) cat(",");
+	}
+	cat("\n");
+}
+
+
+// =============================================================================
+// compute union-of-sites counts per mutation type from all mutations
+// Returns c(union_m0, union_m1, union_m2, union_m3, union_m4, union_m5)
+// =============================================================================
+function (integer)computeUnionCounts(void)
+{
+	all_mt = sim.mutations.mutationType;
+	return c(sum(all_mt == m0), sum(all_mt == m1), sum(all_mt == m2),
+	         sum(all_mt == m3), sum(all_mt == m4), sum(all_mt == m5));
+}
+
+
+initialize() {
+	initializeSLiMModelType("WF");
+
+	// Q scaling factor: default 1 (unscaled).
+	if (!exists("Q")) defineConstant("Q", 1);
+
+	// Ne defaults computed from biological values and Q
+	if (!exists("ANCESTRAL_NE")) defineConstant("ANCESTRAL_NE", asInteger(25000 / Q));
+	if (!exists("POST_COL_NE")) defineConstant("POST_COL_NE", asInteger(5000 / Q));
+	if (!exists("BOTTLENECK_NE")) defineConstant("BOTTLENECK_NE", asInteger(3700 / Q));
+	if (!exists("EXPANDED_NE")) defineConstant("EXPANDED_NE", asInteger(55000 / Q));
+	if (!exists("SEED")) defineConstant("SEED", 12345);
+	if (!exists("OUTPUT_DIR")) defineConstant("OUTPUT_DIR", "results");
+	if (!exists("REPLICATE")) defineConstant("REPLICATE", 1);
+	if (!exists("BURNIN_LOAD")) defineConstant("BURNIN_LOAD", 0);
+	if (!exists("BURNIN_SAVE")) defineConstant("BURNIN_SAVE", 0);
+	if (!exists("BURNIN_RESEED")) defineConstant("BURNIN_RESEED", 1);
+
+	// Sample size for individual-level metrics
+	if (!exists("SAMPLE_SIZE")) defineConstant("SAMPLE_SIZE", 100);
+
+	setSeed(SEED);
+
+	// === Timeline ===
+	if (!exists("BURNIN_GENS")) defineConstant("BURNIN_GENS", asInteger(ANCESTRAL_NE * 5));
+	defineConstant("ANCIENT_DURATION", asInteger(200 / Q));
+	defineConstant("RECOVERY_DURATION", asInteger(300 / Q));
+	defineConstant("POST_COL_EQUILIBRIUM", asInteger(2000 / Q));
+
+	defineConstant("T_SPLIT", BURNIN_GENS + 1);
+	defineConstant("T_ANCIENT_END", T_SPLIT + ANCIENT_DURATION);
+	defineConstant("T_RECOVERY_END", T_ANCIENT_END + RECOVERY_DURATION);
+	defineConstant("T_EQUILIBRIUM_END", T_RECOVERY_END + POST_COL_EQUILIBRIUM);
+
+	// T_SNAPSHOT: when all 17 populations are measured before CE3/E3 recovery
+	defineConstant("T_SNAPSHOT", T_EQUILIBRIUM_END);
+
+	// Recent recovery: 20 real gen Ne ramp + 80 real gen monitoring = 100 real gen total
+	// All Q-scaled to represent the same real-time duration at any Q
+	defineConstant("RECOVERY_DURATION_RECENT", asInteger(max(1.0, 20.0 / Q)));
+	defineConstant("MONITORING_DURATION", asInteger(max(1.0, 100.0 / Q)));
+	defineConstant("T_REC_10", T_SNAPSHOT + asInteger(max(1.0, 10.0 / Q)));
+	defineConstant("T_REC_20", T_SNAPSHOT + asInteger(max(1.0, 20.0 / Q)));
+	defineConstant("T_REC_60", T_SNAPSHOT + asInteger(max(1.0, 60.0 / Q)));
+	defineConstant("T_REC_END", T_SNAPSHOT + MONITORING_DURATION);
+	defineConstant("T_END", T_REC_END);
+
+	// Recent bottleneck timings (real generations before T_SNAPSHOT, Q-scaled)
+	// Timing gradient: 5, 10, 20, 50 real generations
+	// Severity gradient uses t=10 as the basis
+	defineConstant("T_RECENT_5", T_SNAPSHOT - asInteger(max(1.0, 5.0 / Q)));
+	defineConstant("T_RECENT_10", T_SNAPSHOT - asInteger(max(1.0, 10.0 / Q)));
+	defineConstant("T_RECENT_20", T_SNAPSHOT - asInteger(max(1.0, 20.0 / Q)));
+	defineConstant("T_RECENT_50", T_SNAPSHOT - asInteger(max(1.0, 50.0 / Q)));
+
+	// CE bottleneck Ne values (absolute; match E values from POST_COL_NE)
+	defineConstant("CE_SEV2_NE", asInteger(max(10.0, POST_COL_NE / 2)));
+	defineConstant("CE_SEV5_NE", asInteger(max(10.0, POST_COL_NE / 5)));
+	defineConstant("CE_SEV10_NE", asInteger(max(10.0, POST_COL_NE / 10)));
+	defineConstant("CE_SEV20_NE", asInteger(max(10.0, POST_COL_NE / 20)));
+
+	// E bottleneck Ne values (from POST_COL_NE)
+	defineConstant("E_SEV2_NE", asInteger(max(10.0, POST_COL_NE / 2)));
+	defineConstant("E_SEV5_NE", asInteger(max(10.0, POST_COL_NE / 5)));
+	defineConstant("E_SEV10_NE", asInteger(max(10.0, POST_COL_NE / 10)));
+	defineConstant("E_SEV20_NE", asInteger(max(10.0, POST_COL_NE / 20)));
+
+	// === DFE: Kim et al. 2017 gamma + Kyriazis et al. 2023 h-s relationship ===
+	defineConstant("h_wkDel", 0.45);
+	defineConstant("h_modDel", 0.2);
+	defineConstant("h_strDel", 0.05);
+	defineConstant("h_sublet", 0.0);
+	defineConstant("h_let", 0.0);
+
+	defineConstant("gamma_mean", -0.01314833 * Q);
+	defineConstant("gamma_shape", 0.186);
+	defineConstant("bound_wk", -0.001 * Q);
+	defineConstant("bound_mod", -0.01 * Q);
+	defineConstant("bound_str", -0.1 * Q);
+
+	initializeMutationType("m1", h_wkDel, "s",
+		"do x=rgamma(1, gamma_mean, gamma_shape); while (x < bound_wk); return x;");
+	initializeMutationType("m2", h_modDel, "s",
+		"do x=rgamma(1, gamma_mean, gamma_shape); while (x < bound_mod | x >= bound_wk); return x;");
+	initializeMutationType("m3", h_strDel, "s",
+		"do x=rgamma(1, gamma_mean, gamma_shape); while (x < bound_str | x >= bound_mod); return x;");
+	initializeMutationType("m4", h_sublet, "s",
+		"do x=rgamma(1, gamma_mean, gamma_shape); while (x >= bound_str); return x;");
+	initializeMutationType("m5", h_let, "f", -1.0 * Q);
+
+	// Neutral (synonymous) mutation type - no fitness effect
+	initializeMutationType("m0", 0.5, "f", 0.0);
+
+	// convertToSubstitution = T: mutations fixed in ALL subpopulations are removed.
+	// Speeds up burn-in. Between-population comparisons UNAFFECTED because
+	// burn-in fixations are shared identically by all daughter populations.
+	m0.convertToSubstitution = T;
+	m1.convertToSubstitution = T;
+	m2.convertToSubstitution = T;
+	m3.convertToSubstitution = T;
+	m4.convertToSubstitution = T;
+	m5.convertToSubstitution = T;
+
+	defineConstant("let_frac", 0.003);
+	defineConstant("ns_frac", 2.31 / 3.31);   // nonsynonymous fraction
+	defineConstant("syn_frac", 1.0 / 3.31);   // synonymous (neutral) fraction
+
+	initializeGenomicElementType("g1", c(m0, m1, m2, m3, m4, m5),
+		c(syn_frac,
+		  0.491*(1-let_frac)*ns_frac,
+		  0.247*(1-let_frac)*ns_frac,
+		  0.236*(1-let_frac)*ns_frac,
+		  0.026*(1-let_frac)*ns_frac,
+		  let_frac*ns_frac));
+
+	// === Gene-based genome structure ===
+	if (!exists("N_CHROM")) defineConstant("N_CHROM", 5);
+	defineConstant("n_chrom", asInteger(max(2, N_CHROM)));
+	defineConstant("genes_per_chrom", 500);
+	defineConstant("geneLength", 1840);
+	defineConstant("gene_num_total", n_chrom * genes_per_chrom);
+
+	gene_vec = rep(genes_per_chrom, n_chrom);
+
+	for (i in 1:gene_num_total) {
+		initializeGenomicElement(g1, ((i-1)*geneLength)+(i-1), (i*geneLength)+(i-2));
+	}
+
+	rates = NULL;
+	for (i in 1:(size(gene_vec)-1)) {
+		rates = c(rates, 0, rep(c(1e-3, 0), asInteger(gene_vec[i-1]-1)), 0.5);
+	}
+	rates = c(rates, 0, rep(c(1e-3, 0), asInteger(gene_vec[size(gene_vec)-1]-1)));
+
+	ends = NULL;
+	for (i in 1:gene_num_total) {
+		ends = c(ends, (i*geneLength)+(i-2), (i*geneLength)+(i-1));
+	}
+	ends = ends[0:(size(ends)-2)];
+
+	initializeRecombinationRate(rates, ends);
+
+	initializeMutationRate(1.64e-8 * Q);
+
+	defineConstant("OUTPUT_PREFIX", OUTPUT_DIR + "/split_rep" + REPLICATE);
+	if (!exists("BURNIN_FILE")) defineConstant("BURNIN_FILE", OUTPUT_DIR + "/burnin_Q" + asInteger(Q) + "_rep" + REPLICATE + ".slim");
+
+	cat("=== Kyriazis Split Simulation NO-TREE (Q=" + Q + ") ===\n");
+	cat("Ancestral Ne: " + ANCESTRAL_NE + " (real: " + ANCESTRAL_NE*Q + ")\n");
+	cat("Post-col Ne:  " + POST_COL_NE + " (real: " + POST_COL_NE*Q + ")\n");
+	cat("Bottleneck:   " + BOTTLENECK_NE + " (real: " + BOTTLENECK_NE*Q + ")\n");
+	cat("Expansion Ne: " + EXPANDED_NE + " (real: " + EXPANDED_NE*Q + ")\n");
+	cat("Genes: " + gene_num_total + " (" + n_chrom + " chrom x " + genes_per_chrom + " genes x " + geneLength + " bp)\n");
+	cat("Gamma mean (scaled): " + gamma_mean + " (real: -0.01314833)\n");
+	cat("Mutation rate (total, scaled): " + (1.64e-8 * Q) + " (NS+SYN)\n");
+	cat("Mutation types: m0(neutral) m1(wkDel) m2(modDel) m3(strDel) m4(sublethal) m5(lethal)\n");
+	cat("Impact mapping: HIGH=m4+m5, MODERATE=m1+m2+m3, LOW=m0(neutral)\n");
+	cat("Burn-in: " + BURNIN_GENS + " gen (real: " + BURNIN_GENS*Q + ")\n");
+	cat("Recent timings (real gen): t=5,10,20,50 | Severity basis: t=10\n");
+	cat("Snapshot: " + T_SNAPSHOT + " gen | Recovery: " + RECOVERY_DURATION_RECENT + " scaled gen ramp | End: " + T_REC_END + "\n");
+	cat("Total:   " + T_END + " gen (real: " + T_END*Q + ")\n");
+	cat("Sample size: " + SAMPLE_SIZE + " individuals (for genotype metrics)\n");
+	cat("Burn-in load: " + BURNIN_LOAD + " | save: " + BURNIN_SAVE + " | reseed: " + BURNIN_RESEED + "\n");
+	cat("Burn-in file: " + BURNIN_FILE + "\n");
+	cat("================================================\n");
+}
+
+
+// === Phase 1: Initialize ancestral population ===
+1 early() {
+	if (BURNIN_LOAD) {
+		sim.readFromPopulationFile(BURNIN_FILE);
+		if (BURNIN_RESEED)
+			setSeed(SEED);
+		sim.recalculateFitness();
+		cat("[Gen " + sim.cycle + "] Loaded burn-in state from " + BURNIN_FILE + "\n");
+	}
+}
+
+1 late() {
+	if (!BURNIN_LOAD) {
+		sim.addSubpop("p1", ANCESTRAL_NE);
+		cat("[Gen " + sim.cycle + "] Initialized p1 (ancestral, Ne=" + ANCESTRAL_NE + ")\n");
+	}
+}
+
+// Burn-in progress (every 2%)
+1: late() {
+	if (sim.cycle <= BURNIN_GENS) {
+		step = asInteger(max(1.0, BURNIN_GENS / 50.0));
+		if (sim.cycle % step == 0) {
+			pct = asInteger(sim.cycle * 100.0 / BURNIN_GENS);
+			cat("[Burn-in " + pct + "%] Gen " + sim.cycle + "/" + BURNIN_GENS + " | mutations: " + size(sim.mutations) + "\n");
+		}
+	}
+}
+
+
+// === Phase 2: End of burn-in - save state and split populations ===
+BURNIN_GENS late() {
+	cat("[Gen " + sim.cycle + "] Burn-in complete | mutations: " + size(sim.mutations) + "\n");
+
+	if (BURNIN_SAVE & !BURNIN_LOAD) {
+		sim.outputFull(BURNIN_FILE);
+		cat("[Gen " + sim.cycle + "] Saved burn-in state to " + BURNIN_FILE + "\n");
+	}
+
+	sim.addSubpopSplit("p2", EXPANDED_NE, p1);
+	sim.addSubpopSplit("p10", BOTTLENECK_NE, p1);
+	cat("[Gen " + sim.cycle + "] Split: p1 (A), p2 (B, Ne=" + EXPANDED_NE + "), p10 (D, Ne=" + BOTTLENECK_NE + ")\n");
+}
+
+
+// === Phase 3: Ancient bottleneck end + gradual recovery ===
+T_ANCIENT_END early() {
+	cat("[Gen " + sim.cycle + "] Ancient bottleneck END (p10)\n");
+}
+
+(T_ANCIENT_END+1):(T_RECOVERY_END) early() {
+	frac = (sim.cycle - T_ANCIENT_END) / RECOVERY_DURATION;
+	newNe = asInteger(BOTTLENECK_NE + frac * (POST_COL_NE - BOTTLENECK_NE));
+	p10.setSubpopulationSize(newNe);
+}
+
+T_RECOVERY_END late() {
+	p10.setSubpopulationSize(POST_COL_NE);
+	cat("[Gen " + sim.cycle + "] Recovery complete (p10, Ne=" + POST_COL_NE + ")\n");
+}
+
+
+// === Phase 4: Recent bottlenecks ===
+// Timings are in real generations, Q-scaled. Severity gradient at t=10.
+
+T_RECENT_50 early() {
+	sim.addSubpopSplit("p9", CE_SEV10_NE, p1);
+	sim.addSubpopSplit("p17", E_SEV10_NE, p10);
+	cat("[Gen " + sim.cycle + "] Timing gradient (t=50 real gen): CT4 (p9), T4 (p17)\n");
+}
+
+T_RECENT_20 early() {
+	sim.addSubpopSplit("p8", CE_SEV10_NE, p1);
+	sim.addSubpopSplit("p16", E_SEV10_NE, p10);
+	cat("[Gen " + sim.cycle + "] Timing gradient (t=20 real gen): CT3 (p8), T3 (p16)\n");
+}
+
+T_RECENT_10 early() {
+	sim.addSubpopSplit("p3", CE_SEV2_NE, p1);
+	sim.addSubpopSplit("p4", CE_SEV5_NE, p1);
+	sim.addSubpopSplit("p5", CE_SEV10_NE, p1);
+	sim.addSubpopSplit("p6", CE_SEV20_NE, p1);
+
+	sim.addSubpopSplit("p11", E_SEV2_NE, p10);
+	sim.addSubpopSplit("p12", E_SEV5_NE, p10);
+	sim.addSubpopSplit("p13", E_SEV10_NE, p10);
+	sim.addSubpopSplit("p14", E_SEV20_NE, p10);
+
+	cat("[Gen " + sim.cycle + "] Severity gradient (t=10 real gen): CE1-CE4 (p3-p6), E1-E4 (p11-p14)\n");
+}
+
+T_RECENT_5 early() {
+	sim.addSubpopSplit("p7", CE_SEV10_NE, p1);
+	sim.addSubpopSplit("p15", E_SEV10_NE, p10);
+	cat("[Gen " + sim.cycle + "] Timing gradient (t=5 real gen): CT1 (p7), T1 (p15)\n");
+}
+
+
+// =============================================================================
+// Phase 5: Snapshot all 17 populations at T_SNAPSHOT (pre-recovery baseline)
+// =============================================================================
+T_SNAPSHOT early() {
+	cat("[Gen " + sim.cycle + "] === T_SNAPSHOT: measuring all 17 populations ===\n");
+
+	pop_names = c("A", "B", "CE1", "CE2", "CE3", "CE4", "CT1", "CT3", "CT4",
+	              "D", "E1", "E2", "E3", "E4", "T1", "T3", "T4");
+
+	pops = c(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10,
+	         p11, p12, p13, p14, p15, p16, p17);
+
+	// CSV header
+	cat("CSV_START\n");
+	// Build header: common columns + 6 per-mutation-type blocks
+	type_names = c("m0_neutral", "m1_wkDel", "m2_modDel", "m3_strDel", "m4_sublethal", "m5_lethal");
+	type_suffixes = c("_seg_count", "_fix_count", "_count", "_mean_freq",
+	                  "_load_total", "_pop_realized", "_pop_masked",
+	                  "_inbreeding_load", "_prop_het", "_prop_hom_derived",
+	                  "_mean_het_count", "_mean_hom_count");
+	hdr = "generation,replicate,scenario,popSize,genetic_load," +
+	      "inbreeding_load_total,inbreeding_load_s01,inbreeding_load_s099," +
+	      "n_mutations_total";
+	for (ti in seqLen(6))
+		for (si in seqLen(12))
+			hdr = hdr + "," + type_names[ti] + type_suffixes[si];
+	cat(hdr + "\n");
+
+	// Union of all mutations across all 17 populations
+	unions = computeUnionCounts();
+
+	for (i in seqAlong(pops))
+		outputPopCSV(pops[i], pop_names[i], unions[0], unions[1], unions[2], unions[3], unions[4], unions[5]);
+}
+
+
+// =============================================================================
+// Phase 6: 20-gen gradual Ne recovery + 80-gen monitoring at stable parent Ne
+// CE3 lineage (p5): CE_SEV10_NE -> ANCESTRAL_NE over 20 gen, then stable
+// E3 lineage  (p13): E_SEV10_NE -> POST_COL_NE over 20 gen, then stable
+// Snapshots every 20 generations through full 100-gen window
+// =============================================================================
+(T_SNAPSHOT+1):T_REC_20 early() {
+	frac = asFloat(sim.cycle - T_SNAPSHOT) / RECOVERY_DURATION_RECENT;
+
+	ce3r_ne = asInteger(CE_SEV10_NE + frac * (ANCESTRAL_NE - CE_SEV10_NE));
+	p5.setSubpopulationSize(ce3r_ne);
+
+	e3r_ne = asInteger(E_SEV10_NE + frac * (POST_COL_NE - E_SEV10_NE));
+	p13.setSubpopulationSize(e3r_ne);
+}
+
+T_REC_10 early() {
+	cat("[Gen " + sim.cycle + "] === Recovery snapshot t+10 (CE3R, E3R) ===\n");
+	unions = computeUnionCounts();
+	outputPopCSV(p5, "CE3R_10", unions[0], unions[1], unions[2], unions[3], unions[4], unions[5]);
+	outputPopCSV(p13, "E3R_10", unions[0], unions[1], unions[2], unions[3], unions[4], unions[5]);
+}
+
+T_REC_20 early() {
+	cat("[Gen " + sim.cycle + "] === Recovery snapshot t+20 (CE3R, E3R) ===\n");
+	unions = computeUnionCounts();
+	outputPopCSV(p5, "CE3R_20", unions[0], unions[1], unions[2], unions[3], unions[4], unions[5]);
+	outputPopCSV(p13, "E3R_20", unions[0], unions[1], unions[2], unions[3], unions[4], unions[5]);
+}
+
+T_REC_60 early() {
+	cat("[Gen " + sim.cycle + "] === Monitoring snapshot t+60 (CE3R, E3R) ===\n");
+	unions = computeUnionCounts();
+	outputPopCSV(p5, "CE3R_60", unions[0], unions[1], unions[2], unions[3], unions[4], unions[5]);
+	outputPopCSV(p13, "E3R_60", unions[0], unions[1], unions[2], unions[3], unions[4], unions[5]);
+}
+
+T_REC_END early() {
+	cat("[Gen " + sim.cycle + "] === Recovery snapshot t+100 (CE3R, E3R) ===\n");
+	unions = computeUnionCounts();
+	outputPopCSV(p5, "CE3R_100", unions[0], unions[1], unions[2], unions[3], unions[4], unions[5]);
+	outputPopCSV(p13, "E3R_100", unions[0], unions[1], unions[2], unions[3], unions[4], unions[5]);
+	cat("CSV_END\n");
+}
+
+
+// === Phase 7: Final output and finish ===
+T_END late() {
+	cat("[Gen " + sim.cycle + "] Simulation complete\n");
+
+	// Write population map file (17 populations at T_SNAPSHOT)
+	pop_names = c("A", "B", "CE1", "CE2", "CE3", "CE4", "CT1", "CT3", "CT4",
+	              "D", "E1", "E2", "E3", "E4", "T1", "T3", "T4");
+	map = "pop_id\tscenario\n";
+	for (i in 1:17)
+		map = map + i + "\t" + pop_names[i-1] + "\n";
+	writeFile(OUTPUT_PREFIX + "_population_map.tsv", map, append=F);
+
+	// Summary
+	cat("\n=== Final Summary ===\n");
+	cat("m0 (neutral,         LOW):      " + size(sim.mutationsOfType(m0)) + "\n");
+	cat("m1 (weakly del.,     MODERATE): " + size(sim.mutationsOfType(m1)) + "\n");
+	cat("m2 (moderately del., MODERATE): " + size(sim.mutationsOfType(m2)) + "\n");
+	cat("m3 (strongly del.,   MODERATE): " + size(sim.mutationsOfType(m3)) + "\n");
+	cat("m4 (sublethal,       HIGH):     " + size(sim.mutationsOfType(m4)) + "\n");
+	cat("m5 (lethal,          HIGH):     " + size(sim.mutationsOfType(m5)) + "\n");
+	sim.simulationFinished();
+}
