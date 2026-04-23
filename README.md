@@ -17,6 +17,7 @@ scripts/
                       estimation (fastdfe), direction of selection (DoS),
                       R_xy with block jackknife, purifying-load estimation
   SLiM/               Forward simulations under the Kyriazis DFE framework
+  psmc.sh	      Run PSMC to estimate demographic history trajectories for each species
 data/                 Per-species inputs and intermediate files (not tracked)
 figures/              Generated plots
 ```
